@@ -1,0 +1,383 @@
+# Self-contained M0A dependency downloader. No source checkout or extra file upload required.
+# Generated from the local M0A scripts; update this snapshot if those inputs change.
+name: M0A download CPU dependencies
+'on':
+  workflow_dispatch: null
+permissions:
+  contents: read
+jobs:
+  download:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+    - name: Prepare the pinned M0A files
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p m0a/scripts
+        cat > 'm0a/Dockerfile' <<'SKU_M0A_SOURCE_0'
+        # Base digest verified by a non-root Ubuntu runtime/mount probe on 18 Oct 2026.
+        ARG BASE_IMAGE=ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac
+        FROM ${BASE_IMAGE} AS system
+        ENV DEBIAN_FRONTEND=noninteractive \
+            PATH=/opt/venv/bin:$PATH \
+            PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONUNBUFFERED=1 \
+            PIP_DISABLE_PIP_VERSION_CHECK=1 \
+            HOME=/tmp/home \
+            XDG_CACHE_HOME=/tmp/cache \
+            YOLO_CONFIG_DIR=/tmp/ultralytics \
+            MPLCONFIGDIR=/tmp/matplotlib \
+            YOLO_AUTOINSTALL=false \
+            DEVICE=cpu CPU_THREADS=2 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2
+        RUN apt-get update && apt-get install -y --no-install-recommends \
+            python3.12 python3.12-venv ca-certificates ffmpeg libglib2.0-0 libgomp1 \
+            && rm -rf /var/lib/apt/lists/* \
+            && python3.12 -m venv /opt/venv
+        WORKDIR /workspace
+        USER 1000:1000
+
+        FROM system AS torch-cpu
+        USER root
+        RUN python -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.7.1+cpu torchvision==0.22.1+cpu \
+            && python -m pip check
+        USER 1000:1000
+
+        FROM torch-cpu AS cpu-probe
+        USER root
+        COPY requirements-cpu.lock /tmp/requirements-cpu.lock
+        RUN python -m pip install --no-cache-dir pip==25.1.1 \
+            && python -m pip install --no-cache-dir --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cpu -r /tmp/requirements-cpu.lock \
+            && python -m pip check
+        COPY scripts/probe_cpu.py /workspace/scripts/probe_cpu.py
+        # Ubuntu's numeric non-root account is sufficient; Compose overrides UID/GID.
+        USER 1000:1000
+        CMD ["python", "scripts/probe_cpu.py"]
+        SKU_M0A_SOURCE_0
+        cat > 'm0a/.dockerignore' <<'SKU_M0A_SOURCE_1'
+        **
+        !Dockerfile
+        !requirements-cpu.lock
+        !scripts/
+        !scripts/probe_cpu.py
+        SKU_M0A_SOURCE_1
+        cat > 'm0a/requirements.txt' <<'SKU_M0A_SOURCE_2'
+        # M0A direct dependencies; runtime compatibility remains unverified until the gate passes.
+        torch==2.7.1+cpu
+        torchvision==0.22.1+cpu
+        ultralytics-opencv-headless==8.3.253
+        opencv-python-headless==4.12.0.88
+        numpy==2.2.6
+        fastapi==0.115.12
+        uvicorn==0.34.3
+        pydantic==2.11.7
+        PyYAML==6.0.2
+        python-multipart==0.0.20
+        pytest==8.4.0
+        httpx==0.28.1
+        SKU_M0A_SOURCE_2
+        cat > 'm0a/requirements-cpu.lock' <<'SKU_M0A_SOURCE_3'
+        # INCOMPLETE / UNVERIFIED bootstrap pins, not a resolved transitive lock.
+        # Laboratory DNS filters files.pythonhosted.org; regenerate after approved connectivity is restored.
+        # M0A direct dependencies; runtime compatibility remains unverified until the gate passes.
+        torch==2.7.1+cpu
+        torchvision==0.22.1+cpu
+        ultralytics-opencv-headless==8.3.253
+        opencv-python-headless==4.12.0.88
+        numpy==2.2.6
+        fastapi==0.115.12
+        uvicorn==0.34.3
+        pydantic==2.11.7
+        PyYAML==6.0.2
+        python-multipart==0.0.20
+        pytest==8.4.0
+        httpx==0.28.1
+        SKU_M0A_SOURCE_3
+        cat > 'm0a/scripts/prepare_offline_bundle.sh' <<'SKU_M0A_SOURCE_4'
+        #!/usr/bin/env bash
+        # Run at home on macOS or Ubuntu with Docker and unrestricted package connectivity.
+        set -euo pipefail
+        cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+        if [[ ${1:-} == --help ]]; then
+            printf 'Usage: bash scripts/prepare_offline_bundle.sh\nRequires Docker (Linux containers); always targets linux/amd64.\n'
+            exit 0
+        fi
+        [[ $# == 0 ]] || { printf 'Unexpected arguments\n' >&2; exit 2; }
+        # Keep the path fixed so copying this folder back to the lab is unambiguous.
+        if [[ -e offline/bundle || -e offline/sku-m0a-wheelhouse.tar.gz ]]; then
+            printf 'Output already exists. Move offline/bundle and its archive aside before retrying.\n' >&2
+            exit 1
+        fi
+        mkdir -p offline/bundle/evidence/results
+        export LOCAL_UID="$(id -u)" LOCAL_GID="$(id -g)"
+        image=sku-inventory-m0a:home-system
+        docker build --platform linux/amd64 --target system --tag "$image" . \
+          2>&1 | tee offline/bundle/evidence/system-build.log
+        docker run --rm --platform linux/amd64 --user "$LOCAL_UID:$LOCAL_GID" \
+          --cap-drop ALL --security-opt no-new-privileges:true \
+          --mount "type=bind,src=$PWD/requirements.txt,dst=/kit/requirements.txt,readonly" \
+          --mount "type=bind,src=$PWD/scripts,dst=/kit/scripts,readonly" \
+          --mount "type=bind,src=$PWD/offline/bundle,dst=/bundle" \
+          "$image" bash /kit/scripts/download_wheels_container.sh \
+          2>&1 | tee offline/bundle/evidence/download.log
+        # This second container has no network. Successful verification proves wheel closure.
+        docker run --rm --platform linux/amd64 --network none --user "$LOCAL_UID:$LOCAL_GID" \
+          --cap-drop ALL --security-opt no-new-privileges:true \
+          -e EXPECTED_UID="$LOCAL_UID" -e EXPECTED_GID="$LOCAL_GID" \
+          --mount "type=bind,src=$PWD/requirements.txt,dst=/kit/requirements.txt,readonly" \
+          --mount "type=bind,src=$PWD/scripts,dst=/kit/scripts,readonly" \
+          --mount "type=bind,src=$PWD/offline/bundle,dst=/bundle,readonly" \
+          --mount "type=bind,src=$PWD/offline/bundle/evidence/results,dst=/workspace/results" \
+          "$image" bash /kit/scripts/verify_wheels_container.sh \
+          2>&1 | tee offline/bundle/evidence/offline-verification.log
+        printf 'Home offline verification passed. Lab M0A acceptance is still pending.\n' > offline/bundle/evidence/HOME_VERIFIED.txt
+        tar -czf offline/sku-m0a-wheelhouse.tar.gz.partial -C offline bundle
+        mv offline/sku-m0a-wheelhouse.tar.gz.partial offline/sku-m0a-wheelhouse.tar.gz
+        if command -v sha256sum >/dev/null 2>&1; then
+            (cd offline && sha256sum sku-m0a-wheelhouse.tar.gz > sku-m0a-wheelhouse.tar.gz.sha256)
+        else
+            (cd offline && shasum -a 256 sku-m0a-wheelhouse.tar.gz > sku-m0a-wheelhouse.tar.gz.sha256)
+        fi
+        printf '\nTransfer these two files to the lab:\n%s\n%s\n' \
+          "$PWD/offline/sku-m0a-wheelhouse.tar.gz" "$PWD/offline/sku-m0a-wheelhouse.tar.gz.sha256"
+        SKU_M0A_SOURCE_4
+        cat > 'm0a/scripts/download_wheels_container.sh' <<'SKU_M0A_SOURCE_5'
+        #!/usr/bin/env bash
+        # Internal: invoked only in a disposable Ubuntu 24.04 Linux/amd64 container.
+        set -euo pipefail
+        [[ $(uname -m) == x86_64 ]]
+        python -c 'import sys; assert sys.version_info[:2] == (3, 12)'
+        mkdir -p /bundle/wheelhouse /bundle/evidence
+        cp /kit/requirements.txt /bundle/requirements-input.txt
+        python -m venv /tmp/download-venv
+        export PATH=/tmp/download-venv/bin:$PATH
+        export PIP_CONFIG_FILE=/dev/null PIP_DISABLE_PIP_VERSION_CHECK=1
+        # Download the CPU pair exclusively from its official index, without dependencies.
+        python -m pip --isolated download --only-binary=:all: --no-deps \
+          --index-url https://download.pytorch.org/whl/cpu --dest /bundle/wheelhouse \
+          torch==2.7.1+cpu torchvision==0.22.1+cpu
+        python -m pip --isolated download --only-binary=:all: --no-deps \
+          --index-url https://pypi.org/simple --dest /bundle/wheelhouse pip==25.1.1
+        python -m pip --isolated install --no-index --find-links=/bundle/wheelhouse pip==25.1.1
+        # Resolve all transitive dependencies for the actual Linux/amd64 Python runtime.
+        # The +cpu pins select the two already downloaded local CPU wheels.
+        python -m pip --isolated download --only-binary=:all: \
+          --index-url https://pypi.org/simple --find-links=/bundle/wheelhouse \
+          --dest /bundle/wheelhouse -r /kit/requirements.txt pip==25.1.1
+        python /kit/scripts/offline_bundle.py create /bundle
+        python /kit/scripts/offline_bundle.py verify /bundle --requirements /kit/requirements.txt
+        SKU_M0A_SOURCE_5
+        cat > 'm0a/scripts/verify_wheels_container.sh' <<'SKU_M0A_SOURCE_6'
+        #!/usr/bin/env bash
+        # Internal: fresh container, --network none, bundle mounted read-only.
+        set -euo pipefail
+        python /kit/scripts/offline_bundle.py verify /bundle --requirements /kit/requirements.txt
+        python -m venv /tmp/offline-venv
+        /tmp/offline-venv/bin/python -m pip --isolated install --no-index --only-binary=:all: \
+          --find-links=/bundle/wheelhouse --require-hashes -r /bundle/requirements-cpu.lock
+        /tmp/offline-venv/bin/python -m pip check
+        /tmp/offline-venv/bin/python /kit/scripts/probe_cpu.py
+        /tmp/offline-venv/bin/python -m pip freeze --all
+        SKU_M0A_SOURCE_6
+        cat > 'm0a/scripts/offline_bundle.py' <<'SKU_M0A_SOURCE_7'
+        """Create/check a portable checksum manifest and a fully hashed wheel lock."""
+        import argparse
+        from email.parser import BytesParser
+        import hashlib
+        import json
+        from pathlib import Path
+        import platform
+        import re
+        import sys
+        import zipfile
+
+
+        def digest(path):
+            with path.open('rb') as stream:
+                return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+        def lock_text(root):
+            packages = {}
+            wheels = sorted((root / 'wheelhouse').glob('*.whl'))
+            if not wheels:
+                raise ValueError('Wheelhouse is empty')
+            for wheel in wheels:
+                with zipfile.ZipFile(wheel) as archive:
+                    names = [n for n in archive.namelist() if n.endswith('.dist-info/METADATA')]
+                    if len(names) != 1:
+                        raise ValueError(f'Invalid wheel metadata: {wheel.name}')
+                    info = BytesParser().parsebytes(archive.read(names[0]))
+                name = re.sub(r'[-_.]+', '-', info['Name']).lower()
+                version = info['Version']
+                if not re.fullmatch(r'[a-z0-9][a-z0-9-]*', name) or not re.fullmatch(r'[A-Za-z0-9.+!_-]+', version):
+                    raise ValueError('Invalid package name/version')
+                if name in packages:
+                    raise ValueError(f'Multiple wheels for {name}; use a fresh output directory')
+                if name.startswith('nvidia-') or name in {'opencv-python', 'opencv-contrib-python', 'opencv-contrib-python-headless', 'ultralytics'}:
+                    raise ValueError(f'Unexpected CPU/headless dependency: {name}')
+                packages[name] = f'{name}=={version} --hash=sha256:{digest(wheel)}'
+            for name in ('pip', 'torch', 'torchvision', 'ultralytics-opencv-headless', 'opencv-python-headless'):
+                if name not in packages:
+                    raise ValueError(f'Required wheel missing: {name}')
+            for name in ('torch', 'torchvision'):
+                if '+cpu ' not in packages[name]:
+                    raise ValueError(f'CPU wheel required: {name}')
+            return '# Linux x86-64 / CPython 3.12, generated from the downloaded wheel metadata.\n' + '\n'.join(packages[n] for n in sorted(packages)) + '\n'
+
+
+        def payload_files(root):
+            return sorted([*(root / 'wheelhouse').glob('*.whl'), root / 'requirements-cpu.lock',
+                           root / 'requirements-input.txt', root / 'target.json'])
+
+
+        def main():
+            parser = argparse.ArgumentParser(description=__doc__)
+            parser.add_argument('action', choices=('create', 'verify'))
+            parser.add_argument('bundle', type=Path)
+            parser.add_argument('--requirements', type=Path)
+            args = parser.parse_args()
+            root = args.bundle.resolve()
+            if platform.machine() != 'x86_64' or sys.version_info[:2] != (3, 12):
+                raise ValueError('Run this inside the Linux/amd64 Python 3.12 system image')
+            release = Path('/etc/os-release').read_text()
+            if 'ID=ubuntu\n' not in release or 'VERSION_ID="24.04"' not in release:
+                raise ValueError('Ubuntu 24.04 is required')
+            if args.action == 'create':
+                (root / 'requirements-cpu.lock').write_text(lock_text(root))
+                (root / 'target.json').write_text(json.dumps({'os': 'ubuntu:24.04', 'architecture': 'x86_64',
+                                                            'python': platform.python_version(), 'format': 1}, indent=2) + '\n')
+                sums = ''.join(f'{digest(p)}  {p.relative_to(root).as_posix()}\n' for p in payload_files(root))
+                (root / 'SHA256SUMS').write_text(sums)
+            else:
+                expected = {}
+                for line in (root / 'SHA256SUMS').read_text().splitlines():
+                    sha, name = line.split('  ', 1)
+                    if name in expected or not re.fullmatch('[0-9a-f]{64}', sha):
+                        raise ValueError('Invalid checksum manifest')
+                    path = (root / name).resolve()
+                    if not path.is_relative_to(root) or not path.is_file() or digest(path) != sha:
+                        raise ValueError(f'Checksum mismatch or invalid path: {name}')
+                    expected[name] = sha
+                actual = {p.relative_to(root).as_posix() for p in payload_files(root)}
+                if set(expected) != actual:
+                    raise ValueError('Checksum manifest does not match the wheel/lock payload')
+                if (root / 'requirements-cpu.lock').read_text() != lock_text(root):
+                    raise ValueError('Lock does not match wheel metadata')
+                if args.requirements and args.requirements.read_bytes() != (root / 'requirements-input.txt').read_bytes():
+                    raise ValueError('Bundle was generated for different requirements.txt; regenerate the bundle')
+                target = json.loads((root / 'target.json').read_text())
+                if target.get('os') != 'ubuntu:24.04' or target.get('architecture') != 'x86_64' or not target.get('python', '').startswith('3.12.'):
+                    raise ValueError('Incorrect bundle target')
+            print(f'PASS: bundle {args.action}; {len(list((root / "wheelhouse").glob("*.whl")))} wheels')
+
+
+        if __name__ == '__main__':
+            main()
+        SKU_M0A_SOURCE_7
+        cat > 'm0a/scripts/probe_cpu.py' <<'SKU_M0A_SOURCE_8'
+        """M0A container probe only: no application, models, or real footage."""
+        import importlib.metadata as metadata
+        import json
+        import os
+        from pathlib import Path
+        import platform
+        import subprocess
+        import sys
+        import tempfile
+
+        import cv2
+        import fastapi
+        import httpx
+        import multipart
+        import numpy as np
+        import pydantic
+        import pytest
+        import torch
+        import torchvision
+        import ultralytics
+        import uvicorn
+        import yaml
+
+
+        def require(condition, message):
+            if not condition:
+                raise RuntimeError(message)
+
+
+        require(sys.version_info[:2] == (3, 12), "Python 3.12 is required")
+        require('VERSION_ID="24.04"' in Path('/etc/os-release').read_text(), "Ubuntu 24.04 required")
+        require(platform.machine() == 'x86_64', "x86-64 required")
+        require(os.getuid() != 0, "Run as the developer UID/GID, not root")
+        require(os.getuid() == int(os.environ['EXPECTED_UID']), "Unexpected UID")
+        require(os.getgid() == int(os.environ['EXPECTED_GID']), "Unexpected GID")
+        require(os.environ.get('DEVICE', 'cpu') == 'cpu', "M0A supports DEVICE=cpu only")
+        require(torch.version.cuda is None and not torch.cuda.is_available(), "CPU-only torch required")
+        require('+cpu' in torch.__version__ and '+cpu' in torchvision.__version__, "CPU wheels required")
+        installed = {d.metadata['Name'].lower().replace('_', '-') for d in metadata.distributions()}
+        opencv = installed & {'opencv-python', 'opencv-python-headless', 'opencv-contrib-python', 'opencv-contrib-python-headless'}
+        require(opencv == {'opencv-python-headless'}, f"Exactly one headless OpenCV required: {opencv}")
+        require(not any(name.startswith('nvidia-') for name in installed), "NVIDIA packages found")
+        subprocess.run([sys.executable, '-m', 'pip', 'check'], check=True)
+        threads = int(os.environ.get('CPU_THREADS', '2'))
+        require(threads > 0, "CPU_THREADS must be positive")
+        torch.set_num_threads(threads)
+        x = torch.arange(4, dtype=torch.float32, device='cpu').reshape(2, 2)
+        require(torch.equal(x @ x, torch.tensor([[2., 3.], [6., 11.]])), "CPU matmul failed")
+        # Exercise the compiled torchvision operation too, detecting wheel incompatibility.
+        keep = torchvision.ops.nms(torch.tensor([[0., 0., 10., 10.], [1., 1., 9., 9.]]), torch.tensor([.9, .8]), .5)
+        require(keep.tolist() == [0], "torchvision CPU NMS failed")
+        output = Path('/workspace/results')
+        with tempfile.TemporaryDirectory(prefix='m0a-', dir=output) as temp:
+            video = Path(temp) / 'synthetic.mp4'
+            subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i',
+                            'testsrc2=size=64x48:rate=5:duration=1', '-c:v', 'mpeg4', '-threads', '1', str(video)], check=True)
+            subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-i', str(video), '-f', 'null', '-'], check=True)
+            capture = cv2.VideoCapture(str(video))
+            frames = 0
+            try:
+                while True:
+                    ok, frame = capture.read()
+                    if not ok:
+                        break
+                    require(frame.shape == (48, 64, 3), "Unexpected decoded frame shape")
+                    frames += 1
+            finally:
+                capture.release()
+            require(frames == 5, f"Expected five synthetic frames, got {frames}")
+        versions = {name: metadata.version(name) for name in [
+            'torch', 'torchvision', 'ultralytics-opencv-headless', 'opencv-python-headless',
+            'numpy', 'fastapi', 'uvicorn', 'pydantic', 'PyYAML', 'python-multipart', 'pytest', 'httpx']}
+        report = {'status': 'passed', 'python': sys.version, 'versions': versions,
+                  'uid': os.getuid(), 'gid': os.getgid(), 'device': 'cpu', 'dtype': 'float32',
+                  'threads': threads, 'synthetic_frames': frames,
+                  'ffmpeg': subprocess.check_output(['ffmpeg', '-version'], text=True).splitlines()[0]}
+        artifact = output / 'm0a-probe.json'
+        artifact.write_text(json.dumps(report, indent=2) + '\n')
+        require(artifact.stat().st_uid == os.getuid() and artifact.stat().st_gid == os.getgid(), "Output ownership mismatch")
+        print(json.dumps(report, indent=2))
+        SKU_M0A_SOURCE_8
+    - name: Download wheels and verify installation without network
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd m0a
+        bash scripts/prepare_offline_bundle.sh
+    - name: Upload verified CPU wheel package
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      with:
+        name: sku-m0a-linux-amd64-cpu-wheelhouse
+        path: |
+          m0a/offline/sku-m0a-wheelhouse.tar.gz
+          m0a/offline/sku-m0a-wheelhouse.tar.gz.sha256
+        if-no-files-found: error
+        retention-days: 7
+        compression-level: 0
+    - name: Upload diagnostic logs if preparation fails
+      if: failure()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      with:
+        name: sku-m0a-preparation-logs
+        path: m0a/offline/bundle/evidence/
+        if-no-files-found: ignore
+        retention-days: 7
