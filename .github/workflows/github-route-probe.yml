@@ -1,0 +1,30 @@
+# Copy to .github/workflows/github-route-probe.yml in the chosen repository.
+# Manual test only; no project source, Python packages, credentials or video data.
+name: M0A GitHub artifact route probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  artifact-route:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Create a small deterministic artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'M0A GitHub Actions artifact download probe\n' > github-route-probe.txt
+          sha256sum github-route-probe.txt > github-route-probe.txt.sha256
+      - name: Upload route probe
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: m0a-github-route-probe
+          path: |
+            github-route-probe.txt
+            github-route-probe.txt.sha256
+          if-no-files-found: error
+          retention-days: 2
