@@ -204,7 +204,7 @@ jobs:
                 raise ValueError('Wheelhouse is empty')
             for wheel in wheels:
                 with zipfile.ZipFile(wheel) as archive:
-                    names = [n for n in archive.namelist() if n.endswith('.dist-info/METADATA')]
+                    names = [n for n in archive.namelist() if n.count('/') == 1 and n.endswith('.dist-info/METADATA')]
                     if len(names) != 1:
                         raise ValueError(f'Invalid wheel metadata: {wheel.name}')
                     info = BytesParser().parsebytes(archive.read(names[0]))
